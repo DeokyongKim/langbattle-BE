@@ -1,93 +1,103 @@
-from flask import Flask, request, jsonify
-from threading import Lock
-import time
+# main.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict, List, Optional
 
-app = Flask(__name__)
-lock = Lock()
-
+# Vercel은 서버리스 환경이므로, 함수 호출마다 상태가 초기화됩니다.
+# 따라서 실제로는 외부 DB(Redis, Firestore 등)를 사용해야 하지만,
+# 데모 버전을 위해 임시로 메모리에 상태를 저장하는 것으로 가정합니다.
+# 이 코드는 Vercel의 warm start 상태에서만 제대로 동작합니다.
+# 콜드 스타트 시에는 상태가 초기화될 수 있음을 유의하세요.
 game_state = {
-    "player_1": {"position": [0, 0], "hp": 10},
-    "player_2": {"position": [0, 0], "hp": 10},
-    "last_update_time": time.time()
+    "players": {}, # { "player1_id": {"name": "...", "health": 5}, ... }
+    "status": "waiting",
+    "player_count": 0,
+    "current_player_id": None
 }
-connected_players = 0
-player_last_seen = {}
-# Vercel은 서버리스 환경이므로 백그라운드 스레드를 사용할 수 없습니다.
-# 따라서 INACTIVITY_TIMEOUT은 클라이언트가 주기적으로 ping을 보내지 않으면
-# 연결이 끊겼다고 가정하는 용도로만 사용됩니다.
-INACTIVITY_TIMEOUT = 10  # 10초 동안 응답이 없으면 접속 끊김으로 간주
 
-def reset_game_state():
-    """게임 상태를 초기화합니다."""
-    global connected_players
-    connected_players = 0
-    game_state["player_1"]["hp"] = 10
-    game_state["player_2"]["hp"] = 10
-    game_state["last_update_time"] = time.time()
-    player_last_seen.clear()
-    print("Game state has been reset.")
+app = FastAPI()
 
-def check_for_disconnection():
-    """요청 시점에 플레이어의 연결 상태를 확인하고, 타임아웃된 플레이어가 있으면 게임을 리셋합니다."""
-    global connected_players
-    with lock:
-        current_time = time.time()
-        disconnected_players = []
-        for player_id, last_seen in player_last_seen.items():
-            if current_time - last_seen > INACTIVITY_TIMEOUT:
-                disconnected_players.append(player_id)
+class Player(BaseModel):
+    name: str
+
+class Attack(BaseModel):
+    attacker_id: str
+    target_id: str
+    damage: int
+
+# 플레이어가 게임에 접속하는 엔드포인트
+@app.post("/join")
+async def join_game(player: Player):
+    # 최대 2명의 플레이어만 허용
+    if game_state["player_count"] >= 2:
+        raise HTTPException(status_code=403, detail="Game is full")
+    
+    # 플레이어 ID 할당
+    player_id = f"player{game_state['player_count'] + 1}"
+    
+    # 플레이어 정보 저장
+    game_state["players"][player_id] = {
+        "name": player.name,
+        "health": 5
+    }
+    game_state["player_count"] += 1
+    
+    # 두 명의 플레이어가 모두 접속하면 게임 시작 상태로 변경
+    if game_state["player_count"] == 2:
+        game_state["status"] = "started"
+        message = "Game starting"
+    else:
+        message = "Waiting for another player"
         
-        if disconnected_players:
-            print(f"Players {disconnected_players} timed out.")
-            reset_game_state()
+    return {"status": "success", "player_id": player_id, "message": message}
 
-@app.route('/connect', methods=['POST'])
-def connect():
-    """새로운 플레이어를 연결하고 플레이어 ID를 할당합니다."""
-    global connected_players
-    with lock:
-        if connected_players < 2:
-            connected_players += 1
-            player_id = connected_players
-            player_last_seen[player_id] = time.time()
-            return jsonify({"player_id": player_id})
-    return jsonify({"error": "Max players reached"}), 400
+# 게임 상태를 확인하는 엔드포인트
+@app.get("/check_status")
+async def check_game_status():
+    return {"game_status": game_state["status"]}
 
-@app.route('/update_state', methods=['POST'])
-def update_state():
-    """플레이어의 위치, 데미지 등 게임 상태를 업데이트합니다."""
-    data = request.json
-    player_id = data.get("player_id")
+# ChatGPT API를 이용해 문제를 생성하는 엔드포인트
+# 이 부분은 실제 ChatGPT API 연동 코드로 대체되어야 합니다.
+@app.get("/get_problem")
+async def get_problem():
+    # 실제로는 ChatGPT API를 호출하여 문제를 생성해야 합니다.
+    # 여기서는 데모용으로 정적 데이터를 반환합니다.
+    return {
+        "question": "What is the capital of France?",
+        "answers": ["Paris", "Berlin", "London", "Rome"]
+    }
 
-    # Vercel 환경에서는 요청이 들어올 때마다 상태를 체크합니다.
-    check_for_disconnection()
+# 상대방을 공격하고 체력을 업데이트하는 엔드포인트
+@app.post("/update_health")
+async def update_health(attack: Attack):
+    # 대상 플레이어가 존재하는지 확인
+    if attack.target_id not in game_state["players"]:
+        raise HTTPException(status_code=404, detail="Target player not found")
 
-    if player_id not in player_last_seen:
-        return jsonify({"error": "Player not connected"}), 400
+    # 대상 플레이어의 체력 업데이트
+    game_state["players"][attack.target_id]["health"] -= attack.damage
 
-    with lock:
-        player_last_seen[player_id] = time.time()  # 마지막 통신 시간 업데이트
-        
-        # 플레이어 위치 업데이트
-        position = data.get("position")
-        if position:
-            game_state[f"player_{player_id}"]["position"] = position
-        
-        # 총알 명중 시 상대방 체력 감소
-        if data.get("type") == "damage":
-            target_id = 1 if player_id == 2 else 2
-            game_state[f"player_{target_id}"]["hp"] -= 1
-            print(f"Player {player_id} hit Player {target_id}! HP of Player {target_id} is now {game_state[f'player_{target_id}']['hp']}.")
-        
-        game_state["last_update_time"] = time.time()
-        return jsonify({"message": "State updated"})
+    # 게임 상태에 따른 응답 반환
+    if game_state["players"][attack.target_id]["health"] <= 0:
+        return {"status": "game_over", "winner": attack.attacker_id}
+    
+    return {"status": "success", "message": "Health updated"}
 
-@app.route('/get_state', methods=['GET'])
-def get_state():
-    """현재 게임 상태를 반환합니다."""
-    # Vercel 환경에서는 요청이 들어올 때마다 상태를 체크합니다.
-    check_for_disconnection()
-    return jsonify(game_state)
+# 두 플레이어의 현재 체력 정보를 가져오는 엔드포인트
+@app.get("/get_game_state")
+async def get_game_state():
+    return {
+        "player1_health": game_state["players"].get("player1", {}).get("health", 0),
+        "player2_health": game_state["players"].get("player2", {}).get("health", 0),
+    }
 
-# Vercel은 __name__ == '__main__' 블록을 사용하지 않으므로 삭제합니다.
-# Flask 앱 객체인 `app`이 Vercel 서버리스 함수로 사용됩니다.
+# 게임 상태 초기화 (재시작용)
+@app.get("/reset")
+async def reset_game():
+    game_state.clear()
+    game_state.update({
+        "players": {},
+        "status": "waiting",
+        "player_count": 0
+    })
+    return {"status": "success", "message": "Game state reset"}
